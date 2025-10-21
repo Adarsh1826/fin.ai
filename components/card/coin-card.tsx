@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useContext } from "react";
+import React, { useEffect, useMemo, useRef, useState, useContext } from "react";
 import {
   View,
   Text,
@@ -10,8 +10,14 @@ import {
   Image,
   TextInput,
   Animated,
+  Pressable,
+  Platform,
+  Dimensions,
 } from "react-native";
 import { ThemeContext } from "@/app/_layout";
+
+import Svg, { Path, Defs, LinearGradient, Stop, Rect } from "react-native-svg";
+import * as shape from "d3-shape";
 
 interface Coin {
   id: string;
@@ -21,8 +27,178 @@ interface Coin {
   image: string;
 }
 
+/* ---------------------------
+   Debounce helper
+   --------------------------- */
+function useDebouncedValue<T>(value: T, delay = 250) {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const t = setTimeout(() => setDebounced(value), delay);
+    return () => clearTimeout(t);
+  }, [value, delay]);
+  return debounced;
+}
+
+/* ---------------------------
+   Sparkline (internal)
+   - lightweight: fetch initial klines and open websocket for updates
+   - expects binance symbol like "BTCUSDT"
+   --------------------------- */
+function Sparkline({
+  pair = "BTCUSDT",
+  interval = "1m",
+  points = 60,
+  width = 300,
+  height = 84,
+  accent = "#34d399",
+}: {
+  pair?: string; // e.g. BTCUSDT
+  interval?: string;
+  points?: number;
+  width?: number;
+  height?: number;
+  accent?: string;
+}) {
+  const [data, setData] = useState<number[]>([]);
+  const [loading, setLoading] = useState(true);
+  const wsRef = useRef<WebSocket | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    setLoading(true);
+    const url = `https://api.binance.com/api/v3/klines?symbol=${pair}&interval=${interval}&limit=${points}`;
+    fetch(url)
+      .then((r) => r.json())
+      .then((klines) => {
+        if (!mounted) return;
+        const closes = (klines || []).map((k: any) => Number(k[4]));
+        setData(closes);
+      })
+      .catch((e) => {
+        console.warn("Sparkline kline fetch failed", e);
+      })
+      .finally(() => mounted && setLoading(false));
+    return () => {
+      mounted = false;
+    };
+  }, [pair, interval, points]);
+
+  // websocket for live updates
+  useEffect(() => {
+    if (!pair) return;
+    const streamSymbol = pair.toLowerCase();
+    const wsUrl = `wss://stream.binance.com:9443/ws/${streamSymbol}@kline_${interval}`;
+    const ws = new WebSocket(wsUrl);
+    wsRef.current = ws;
+
+    ws.onmessage = (evt) => {
+      try {
+        const msg = JSON.parse(evt.data);
+        const k = msg.k;
+        const close = Number(k.c);
+        setData((prev) => {
+          const copy = prev.slice();
+          if (copy.length < points) {
+            copy.push(close);
+            return copy;
+          } else {
+            copy.shift();
+            copy.push(close);
+            return copy;
+          }
+        });
+      } catch (err) {
+        // ignore parse errors
+      }
+    };
+
+    ws.onerror = () => {
+      // ignore
+    };
+
+    return () => {
+      try {
+        ws.close();
+      } catch (e) {}
+    };
+  }, [pair, interval, points]);
+
+  // compute path
+  const padding = 6;
+  const { pathD, areaD, minVal, maxVal } = useMemo(() => {
+    if (!data || data.length === 0) return { pathD: "", areaD: "", minVal: 0, maxVal: 0 };
+    const values = data.slice(-points);
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    const len = values.length;
+    const w = width;
+    const h = height;
+    const xScale = (i: number) => {
+      if (len === 1) return padding + (w - padding * 2) / 2;
+      return padding + (i / (len - 1)) * (w - padding * 2);
+    };
+    const yScale = (v: number) => {
+      if (max === min) return h / 2;
+      const norm = (v - min) / (max - min);
+      return h - padding - norm * (h - padding * 2);
+    };
+    const pts = values.map((v, i) => [xScale(i), yScale(v)]);
+    const line = shape
+      .line()
+      .x((d: any) => d[0])
+      .y((d: any) => d[1])
+      .curve(shape.curveMonotoneX)(pts);
+    const area = shape
+      .area()
+      .x((d: any) => d[0])
+      .y0(height - padding)
+      .y1((d: any) => d[1])
+      .curve(shape.curveMonotoneX)(pts);
+    return { pathD: line || "", areaD: area || "", minVal: min, maxVal: max };
+  }, [data, width, height, points]);
+
+  const latest = data.length ? data[data.length - 1] : undefined;
+  const prev = data.length > 1 ? data[data.length - 2] : undefined;
+  const up = prev == null ? true : (latest ?? 0) >= prev;
+
+  const stroke = up ? accent : "#fb7185";
+
+  return (
+    <View style={{ width, height: height + 12 }}>
+      <View style={{ position: "absolute", right: 6, top: 0 }}>
+        <Text style={{ fontSize: 12, fontWeight: "800", color: stroke }}>{latest ? latest.toLocaleString() : "--"}</Text>
+      </View>
+
+      <View style={{ width, height }}>
+        {loading ? (
+          <View style={{ width, height, justifyContent: "center", alignItems: "center" }}>
+            <ActivityIndicator color={accent} />
+          </View>
+        ) : (
+          <Svg width={width} height={height}>
+            <Defs>
+              <LinearGradient id={`g-${pair}`} x1="0" y1="0" x2="0" y2="1">
+                <Stop offset="0" stopColor={stroke} stopOpacity="0.14" />
+                <Stop offset="1" stopColor={stroke} stopOpacity="0.02" />
+              </LinearGradient>
+            </Defs>
+
+            <Rect x="0" y="0" width={width} height={height} rx={8} fill="transparent" />
+            {areaD ? <Path d={areaD} fill={`url(#g-${pair})`} /> : null}
+            {pathD ? <Path d={pathD} stroke={stroke} strokeWidth={2.2} fill="none" strokeLinejoin="round" strokeLinecap="round" /> : null}
+          </Svg>
+        )}
+      </View>
+    </View>
+  );
+}
+
+/* ---------------------------
+   Main Card (updated)
+   - embeds Sparkline under actions
+   --------------------------- */
 export default function Card() {
-  const GEMINI_API_KEY = "Paste";
+  const GEMINI_API_KEY = "AIzaSyDzZOpxn9ru9aXDl_BSUNi9S7i_oNqRBrc";
   const { theme } = useContext(ThemeContext);
 
   const [coins, setCoins] = useState<Coin[]>([]);
@@ -34,50 +210,65 @@ export default function Card() {
   const [geminiLoading, setGeminiLoading] = useState(false);
   const [geminiSuggestion, setGeminiSuggestion] = useState<string | null>(null);
 
+  const debouncedSearch = useDebouncedValue(searchText, 240);
+
   const fadeAnim = useState(new Animated.Value(1))[0];
+  const scaleAnim = useState(new Animated.Value(1))[0];
 
   const colors = {
     light: {
-      card: "#f5f9f8",
-      text: "#111",
-      accent: "#21bf73",
-      modalOverlay: "rgba(0,0,0,0.2)",
-      inputBg: "#e8f0ef",
+      card: "#ffffff",
+      containerBg: "#f2f6f8",
+      text: "#0b1220",
+      accent: "#0ea5a4",
+      modalOverlay: "rgba(2,6,23,0.25)",
+      inputBg: "#f3faf9",
+      muted: "#6b7280",
+      logoBg: "#f8faf9",
+      subtle: "#eef2f7",
     },
     dark: {
-      card: "#1c1c1c",
-      text: "#fff",
-      accent: "#21bf73",
-      modalOverlay: "rgba(0,0,0,0.6)",
-      inputBg: "#222",
+      card: "#071022",
+      containerBg: "#071022",
+      text: "#e6eef3",
+      accent: "#34d399",
+      modalOverlay: "rgba(2,6,23,0.75)",
+      inputBg: "#0b1220",
+      muted: "#94a3b8",
+      logoBg: "#071022",
+      subtle: "#0b1724",
     },
-  };
-  const current = colors[theme];
+  } as const;
+
+  const current = colors[theme as "light" | "dark"];
+  const W = Dimensions.get("window").width;
+  const sparkW = Math.min(360, Math.floor(W * 0.62)); // responsive width for sparkline
 
   useEffect(() => {
+    let mounted = true;
     fetch(
       "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=100&page=1&sparkline=false"
     )
       .then((res) => res.json())
       .then((data) => {
-        setCoins(data);
-        setFilteredCoins(data);
-        setSelectedCoin(data[0]);
+        if (!mounted) return;
+        setCoins(data || []);
+        setFilteredCoins(data || []);
+        setSelectedCoin(data?.[0] || null);
       })
       .catch((err) => console.log(err))
-      .finally(() => setLoading(false));
+      .finally(() => mounted && setLoading(false));
+    return () => {
+      mounted = false;
+    };
   }, []);
 
-  const handleSearch = (text: string) => {
-    setSearchText(text);
-    const filtered = coins.filter(
-      (coin) =>
-        coin.symbol.toLowerCase().includes(text.toLowerCase()) ||
-        coin.name.toLowerCase().includes(text.toLowerCase())
-    );
+  useEffect(() => {
+    if (!debouncedSearch) return setFilteredCoins(coins);
+    const q = debouncedSearch.toLowerCase();
+    const filtered = coins.filter((c) => c.symbol.toLowerCase().includes(q) || c.name.toLowerCase().includes(q));
     setFilteredCoins(filtered);
-    setGeminiSuggestion("");
-  };
+  }, [debouncedSearch, coins]);
 
   const handleNeedHelp = async () => {
     if (!selectedCoin) return;
@@ -85,124 +276,144 @@ export default function Card() {
     setGeminiLoading(true);
     setGeminiSuggestion(null);
 
-    Animated.timing(fadeAnim, { toValue: 0.3, duration: 300, useNativeDriver: true }).start();
+    Animated.parallel([
+      Animated.timing(fadeAnim, { toValue: 0.6, duration: 220, useNativeDriver: true }),
+      Animated.sequence([
+        Animated.timing(scaleAnim, { toValue: 0.985, duration: 120, useNativeDriver: true }),
+        Animated.timing(scaleAnim, { toValue: 1, duration: 120, useNativeDriver: true }),
+      ]),
+    ]).start();
 
     try {
-      const promptText = `
-You are an educational AI assistant. Your task is to provide a concise cryptocurrency recommendation
-for educational purposes ONLY.
-
-The current price of ${selectedCoin.symbol.toUpperCase()} is $${selectedCoin.current_price.toLocaleString()} USD.
-
-Analyze this price and provide:
-
-1. An approximate price range or price point for **entering** the market, relative to the current price.
-2. An approximate price range or price point for **exiting** the market, relative to the current price.
-
-Answer in **exact numbers** where possible, or ranges if precise numbers aren't available.
-Provide your response in this format:
-
-Enter: <price or range in USD>
-Exit: <price or range in USD>
-
-Keep it short, 2-3 sentences max, purely for educational purposes, and do NOT give financial advice.
-`;
+      const promptText = `You are an educational AI assistant. The current price of ${selectedCoin.symbol.toUpperCase()} is $${selectedCoin.current_price.toLocaleString()}. Provide short educational ranges: Enter: <USD range> Exit: <USD range>. 2 lines max. Not financial advice.`;
 
       const res = await fetch(
         `https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contents: [
-              {
-                role: "user",
-                parts: [{ text: promptText }],
-              },
-            ],
-          }),
+          body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: promptText }] }] }),
         }
       );
 
       const data = await res.json();
-      const suggestion = data?.candidates?.[0]?.content?.parts?.[0]?.text || "No suggestion returned";
-
+      const suggestion = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "No suggestion returned";
       setGeminiSuggestion(suggestion);
     } catch (err) {
       console.error(err);
-      setGeminiSuggestion("Error fetching suggestion from Gemini");
+      setGeminiSuggestion("Error fetching suggestion");
     } finally {
       setGeminiLoading(false);
-      Animated.timing(fadeAnim, { toValue: 1, duration: 300, useNativeDriver: true }).start();
+      Animated.timing(fadeAnim, { toValue: 1, duration: 200, useNativeDriver: true }).start();
     }
   };
 
+  const renderLogo = (coin: Coin | null) => {
+    if (!coin) return null;
+    if (coin.image) return <Image source={{ uri: coin.image }} style={styles.logoImage} />;
+    const initials = coin.symbol?.slice(0, 3).toUpperCase() || "?";
+    return (
+      <View style={[styles.fallbackLogo, { backgroundColor: current.logoBg }]}>
+        <Text style={[styles.fallbackLogoText, { color: current.text }]}>{initials}</Text>
+      </View>
+    );
+  };
+
+  const keyExtractor = (item: Coin) => item.id;
+
+  const emptyList = useMemo(
+    () => (
+      <View style={styles.emptyWrap}>
+        <Text style={[styles.emptyText, { color: current.muted }]}>No coins found</Text>
+      </View>
+    ),
+    [current.muted]
+  );
+
   if (loading) {
     return (
-      <View style={{ flex: 1, justifyContent: "center", alignItems: "center" }}>
+      <View style={[styles.loaderWrap, { backgroundColor: current.containerBg }]}>
         <ActivityIndicator size="large" color={current.accent} />
       </View>
     );
   }
 
+  // build binance pair from selectedCoin symbol
+  const pairForSpark = selectedCoin ? `${selectedCoin.symbol.toUpperCase()}USDT` : "BTCUSDT";
+
   return (
-    <Animated.View style={[style.cont, { backgroundColor: current.card, opacity: fadeAnim }]}>
-      {/* Logo */}
-      <View style={[style.logoContainer, { borderColor: current.accent }]}>
-        {selectedCoin?.image && <Image source={{ uri: selectedCoin.image }} style={style.logo} />}
+    <Animated.View style={[styles.container, { backgroundColor: current.card, opacity: fadeAnim, transform: [{ scale: scaleAnim }] }]}>
+      {/* Logo and quick tag */}
+      <View style={styles.leftWrap}>
+        <View style={[styles.logoWrap, { backgroundColor: current.subtle }]}>{renderLogo(selectedCoin)}</View>
+        <View style={[styles.rankBadge, { backgroundColor: current.logoBg }]}>
+          <Text style={[styles.rankText, { color: current.muted }]}>{selectedCoin ? selectedCoin.symbol.toUpperCase() : "--"}</Text>
+        </View>
       </View>
 
-      {/* Details */}
-      <View style={style.details}>
-        <Text style={[style.label, { color: current.text }]}>Coin</Text>
-        <TouchableOpacity
-          style={[style.dropdown, { backgroundColor: current.inputBg, borderColor: current.accent }]}
-          onPress={() => setModalVisible(true)}
-        >
-          <Text style={[style.dropdownText, { color: current.accent }]}>
-            {selectedCoin?.symbol.toUpperCase()}
+      {/* Main Content */}
+      <View style={styles.contentWrap}>
+        <View style={styles.headerRow}>
+          <Text style={[styles.coinTitle, { color: current.text }]} numberOfLines={1}>
+            {selectedCoin?.name ?? "Choose a coin"}
           </Text>
-        </TouchableOpacity>
+          <Text style={[styles.coinPrice, { color: current.accent }]}>${selectedCoin?.current_price?.toLocaleString() ?? "-"}</Text>
+        </View>
 
-        <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
-          <Text style={[style.label, { color: current.text }]}>Current Price</Text>
-          <TouchableOpacity style={[style.helpButton, { borderColor: current.accent }]} onPress={handleNeedHelp}>
-            <Text style={[style.helpButtonText, { color: current.accent }]}>Need Help</Text>
+        <Text style={[styles.coinSubtitle, { color: current.muted }]} numberOfLines={1}>
+          {selectedCoin?.symbol?.toUpperCase()} • Live
+        </Text>
+
+        <View style={styles.actionsRow}>
+          <Pressable onPress={handleNeedHelp} style={({ pressed }) => [styles.helpButton, { borderColor: current.accent, opacity: pressed ? 0.9 : 1 }]}>
+            {geminiLoading ? <ActivityIndicator size="small" color={current.accent} /> : <Text style={[styles.helpBtnText, { color: current.accent }]}>Need Help</Text>}
+          </Pressable>
+
+          <TouchableOpacity onPress={() => setModalVisible(true)} style={[styles.selectBtn, { backgroundColor: current.inputBg }]}>
+            <Text style={[styles.selectBtnText, { color: current.text }]}>{selectedCoin ? "Change" : "Select"}</Text>
           </TouchableOpacity>
         </View>
 
-        <Text style={[style.price, { color: current.accent }]}>
-          ${selectedCoin?.current_price?.toLocaleString() ?? "-"}
-        </Text>
+        {/* SPARKLINE */}
+        <View style={{ marginTop: 12 }}>
+          <Sparkline pair={pairForSpark} width={sparkW} height={84} accent={current.accent} />
+        </View>
 
-        {geminiLoading && <ActivityIndicator size="small" color={current.accent} />}
-        {geminiSuggestion && (
-          <Text style={[style.geminiText, { color: current.accent, marginTop: 10 }]}>{geminiSuggestion}</Text>
+        {geminiSuggestion ? (
+          <Text style={[styles.suggestionText, { color: current.text }]} numberOfLines={3}>
+            {geminiSuggestion}
+          </Text>
+        ) : (
+          <Text style={[styles.hint, { color: current.muted }]}>Tap "Need Help" for a short educational suggestion.</Text>
         )}
       </View>
 
       {/* Modal */}
       <Modal transparent visible={modalVisible} animationType="fade">
-        <TouchableOpacity
-          style={[style.modalOverlay, { backgroundColor: current.modalOverlay }]}
-          onPress={() => setModalVisible(false)}
-        >
-          <View style={[style.modalContent, { backgroundColor: current.card }]}>
-            <TextInput
-              style={[style.searchInput, { backgroundColor: current.inputBg, color: current.text }]}
-              placeholder="Search coin..."
-              placeholderTextColor={theme === "dark" ? "#aaa" : "#555"}
-              value={searchText}
-              onChangeText={handleSearch}
-            />
+        <TouchableOpacity style={[styles.modalOverlay, { backgroundColor: current.modalOverlay }]} activeOpacity={1} onPress={() => setModalVisible(false)}>
+          <TouchableOpacity activeOpacity={1} style={[styles.modalCard, { backgroundColor: current.card }]}>
+            <View style={styles.modalHeader}>
+              <TextInput style={[styles.searchInput, { backgroundColor: current.inputBg, color: current.text }]} placeholder="Search coin name or symbol" placeholderTextColor={current.muted} value={searchText} onChangeText={setSearchText} autoCorrect={false} autoCapitalize="none" />
+              <TouchableOpacity
+                onPress={() => {
+                  setSearchText("");
+                  setFilteredCoins(coins);
+                }}
+                style={styles.clearBtn}
+              >
+                <Text style={{ color: current.muted, fontWeight: "700" }}>Clear</Text>
+              </TouchableOpacity>
+            </View>
 
             <FlatList
               data={filteredCoins}
-              keyExtractor={(item) => item.id}
-              style={{ maxHeight: 400 }}
+              keyExtractor={keyExtractor}
+              ListEmptyComponent={emptyList}
+              ItemSeparatorComponent={() => <View style={[styles.sep, { backgroundColor: current.subtle }]} />}
               renderItem={({ item }) => (
-                <TouchableOpacity
-                  style={[style.modalItem, { borderBottomColor: theme === "dark" ? "#555" : "#ccc" }]}
+                <Pressable
+                  android_ripple={{ color: "rgba(0,0,0,0.06)" }}
+                  style={styles.coinRow}
                   onPress={() => {
                     setSelectedCoin(item);
                     setModalVisible(false);
@@ -212,99 +423,81 @@ Keep it short, 2-3 sentences max, purely for educational purposes, and do NOT gi
                   }}
                 >
                   <View style={{ flexDirection: "row", alignItems: "center" }}>
-                    <Image source={{ uri: item.image }} style={style.coinLogo} />
-                    <Text style={[style.modalItemText, { color: current.text }]}>
-                      {item.symbol.toUpperCase()} - ${item.current_price.toLocaleString()}
-                    </Text>
+                    {item.image ? <Image source={{ uri: item.image }} style={styles.coinImg} /> : <View style={[styles.coinFallback, { backgroundColor: current.subtle }]}><Text style={[styles.coinFallbackText, { color: current.muted }]}>{item.symbol?.slice(0, 2).toUpperCase()}</Text></View>}
+                    <View style={{ marginLeft: 12, maxWidth: 180 }}>
+                      <Text style={[styles.coinName, { color: current.text }]} numberOfLines={1}>
+                        {item.name}
+                      </Text>
+                      <Text style={[styles.coinSym, { color: current.muted }]} numberOfLines={1}>
+                        {item.symbol.toUpperCase()}
+                      </Text>
+                    </View>
                   </View>
-                </TouchableOpacity>
+
+                  <Text style={[styles.coinPriceSmall, { color: current.muted }]}>${item.current_price.toLocaleString()}</Text>
+                </Pressable>
               )}
+              style={{ maxHeight: 420 }}
             />
-          </View>
+          </TouchableOpacity>
         </TouchableOpacity>
       </Modal>
     </Animated.View>
   );
 }
 
-const style = StyleSheet.create({
-  cont: {
+/* ---------------------------
+   Styles (kept from your previous design)
+   --------------------------- */
+const styles = StyleSheet.create({
+  container: {
     flexDirection: "row",
     alignItems: "center",
-    borderRadius: 20,
-    padding: 20,
+    borderRadius: 14,
+    padding: 14,
     marginVertical: 10,
+    marginHorizontal: 12,
     shadowColor: "#000",
-    shadowOpacity: 0.15,
-    shadowRadius: 10,
-    shadowOffset: { width: 0, height: 5 },
-    elevation: 8,
+    shadowOpacity: 0.06,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 6,
   },
-  logoContainer: {
-    width: 80,
-    height: 80,
-    borderRadius: 40,
-    justifyContent: "center",
-    alignItems: "center",
-    borderWidth: 2,
-    backgroundColor: "#fff",
-    shadowColor: "#000",
-    shadowOpacity: 0.1,
-    shadowRadius: 6,
-    shadowOffset: { width: 0, height: 3 },
-  },
-  logo: { width: 55, height: 55 },
-  details: { flex: 1, marginLeft: 20 },
-  label: { fontSize: 13, fontWeight: "600", marginBottom: 6 },
-  price: { fontSize: 20, fontWeight: "700", marginTop: 6 },
-  dropdown: {
-    padding: 12,
-    borderRadius: 16,
-    marginBottom: 14,
-    borderWidth: 1.5,
-  },
-  dropdownText: { fontSize: 15, fontWeight: "700" },
-  helpButton: {
-    paddingVertical: 8,
-    paddingHorizontal: 14,
-    borderRadius: 16,
-    borderWidth: 1.5,
-  },
-  helpButtonText: {
-    fontWeight: "700",
-  },
-  geminiText: {
-    fontSize: 16,
-    fontWeight: "500",
-    lineHeight: 22,
-  },
-  modalOverlay: {
-    flex: 1,
-    justifyContent: "center",
-    alignItems: "center",
-    paddingHorizontal: 10,
-  },
-  modalContent: {
-    width: "90%",
-    borderRadius: 20,
-    paddingVertical: 14,
-    paddingHorizontal: 18,
-    shadowColor: "#000",
-    shadowOpacity: 0.2,
-    shadowRadius: 15,
-    shadowOffset: { width: 0, height: 5 },
-    elevation: 10,
-  },
-  searchInput: {
-    padding: 12,
-    borderRadius: 16,
-    marginBottom: 14,
-    fontWeight: "600",
-  },
-  modalItem: {
-    paddingVertical: 12,
-    borderBottomWidth: 0.7,
-  },
-  modalItemText: { fontSize: 16, fontWeight: "500" },
-  coinLogo: { width: 32, height: 32, marginRight: 12 },
+  loaderWrap: { flex: 1, justifyContent: "center", alignItems: "center" },
+  leftWrap: { width: 92, alignItems: "center", justifyContent: "center" },
+  logoWrap: { width: 64, height: 64, borderRadius: 12, justifyContent: "center", alignItems: "center" },
+  logoImage: { width: 56, height: 56, borderRadius: 10 },
+  fallbackLogo: { width: 56, height: 56, borderRadius: 10, justifyContent: "center", alignItems: "center" },
+  fallbackLogoText: { fontSize: 18, fontWeight: "800" },
+  rankBadge: { marginTop: 8, paddingVertical: 4, paddingHorizontal: 8, borderRadius: 999 },
+  rankText: { fontSize: 12, fontWeight: "700" },
+  contentWrap: { flex: 1, paddingLeft: 6 },
+  headerRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center" },
+  coinTitle: { fontSize: 16, fontWeight: "800" },
+  coinPrice: { fontSize: 16, fontWeight: "900" },
+  coinSubtitle: { fontSize: 12, marginTop: 4 },
+  actionsRow: { flexDirection: "row", alignItems: "center", marginTop: 10, gap: 10 },
+  helpButton: { paddingVertical: 8, paddingHorizontal: 14, borderRadius: 12, borderWidth: 1.4 },
+  helpBtnText: { fontWeight: "800", fontSize: 13 },
+  selectBtn: { marginLeft: 10, paddingVertical: 8, paddingHorizontal: 12, borderRadius: 10 },
+  selectBtnText: { fontWeight: "800" },
+  suggestionText: { marginTop: 12, fontSize: 13, lineHeight: 18 },
+  hint: { marginTop: 12, fontSize: 12 },
+
+  // Modal
+  modalOverlay: { flex: 1, justifyContent: "center", alignItems: "center", padding: 16 },
+  modalCard: { width: "94%", borderRadius: 14, padding: 12, maxHeight: "86%" },
+  modalHeader: { flexDirection: "row", alignItems: "center", marginBottom: 8 },
+  searchInput: { flex: 1, padding: 12, borderRadius: 10, fontWeight: "600" },
+  clearBtn: { marginLeft: 8 },
+  sep: { height: 1, width: "100%" },
+  coinRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", paddingVertical: 10, paddingHorizontal: 6 },
+  coinImg: { width: 38, height: 38, borderRadius: 8 },
+  coinFallback: { width: 38, height: 38, borderRadius: 8, justifyContent: "center", alignItems: "center" },
+  coinFallbackText: { fontWeight: "800" },
+  coinName: { fontSize: 15, fontWeight: "800" },
+  coinSym: { fontSize: 12, marginTop: 2 },
+  coinPriceSmall: { fontSize: 13, fontWeight: "700" },
+  emptyWrap: { padding: 24, alignItems: "center" },
+  emptyText: { fontSize: 14 },
 });
