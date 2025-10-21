@@ -22,7 +22,7 @@ interface Coin {
 }
 
 export default function Card() {
-  const GEMINI_API_KEY = "AIzaSyDzZOpxn9ru9aXDl_BSUNi9S7i_oNqRBrc";
+  const GEMINI_API_KEY = "Paste";
   const { theme } = useContext(ThemeContext);
 
   const [coins, setCoins] = useState<Coin[]>([]);
